@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# Runtime uploads
+uploads/
+models/
+
+# Local test files
+*.csv
+*.xlsx
+
+# OS files
+.DS_Store
