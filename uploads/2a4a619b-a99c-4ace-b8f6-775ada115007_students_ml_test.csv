@@ -1,0 +1,16 @@
+Student_ID,Age,CGPA,Internships,Branch,Selected
+1,21,8.5,2,CSE,Yes
+2,22,7.8,1,ISE,No
+3,20,9.1,3,CSE,Yes
+4,23,6.9,0,EEE,No
+5,21,8.0,1,ME,No
+6,22,9.3,2,CSE,Yes
+7,20,7.2,0,CE,No
+8,21,8.8,2,ISE,Yes
+9,23,6.5,0,ME,No
+10,22,9.0,3,CSE,Yes
+11,21,7.9,1,EEE,No
+12,20,8.6,2,CSE,Yes
+13,23,6.8,0,CE,No
+14,22,8.4,2,ISE,Yes
+15,21,7.1,1,ME,No

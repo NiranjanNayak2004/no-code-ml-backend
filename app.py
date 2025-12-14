@@ -1,73 +1,63 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pandas as pd
-import os
 import uuid
+
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.metrics import accuracy_score, classification_report
-import joblib
+from sklearn.metrics import accuracy_score
 
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_DIR = "uploads"
-MODEL_DIR = "models"
-
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
-
+# =====================================================
+# In-memory session store (demo-safe, predictable)
+# =====================================================
 SESSIONS = {}
 
-
-# ------------------------------------------------------
-# 1. UPLOAD ROUTE
-# ------------------------------------------------------
+# =====================================================
+# 1. UPLOAD
+# =====================================================
 @app.route("/upload", methods=["POST"])
 def upload():
-    if "file" not in request.files:
+    file = request.files.get("file")
+    if not file:
         return jsonify({"error": "No file uploaded"}), 400
 
-    file = request.files["file"]
-    if file.filename == "":
-        return jsonify({"error": "Empty filename"}), 400
-
-    filename = str(uuid.uuid4()) + "_" + file.filename
-    path = os.path.join(UPLOAD_DIR, filename)
-    file.save(path)
-
-    try:
-        if filename.lower().endswith(".csv"):
-            df = pd.read_csv(path)
-        elif filename.lower().endswith((".xls", ".xlsx")):
-            df = pd.read_excel(path)
-        else:
-            return jsonify({"error": "Unsupported file type"}), 400
-    except Exception as e:
-        return jsonify({"error": "Failed to read file", "details": str(e)}), 400
+    if file.filename.endswith(".csv"):
+        df = pd.read_csv(file)
+    elif file.filename.endswith((".xls", ".xlsx")):
+        df = pd.read_excel(file)
+    else:
+        return jsonify({"error": "Unsupported file format"}), 400
 
     session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {"df": df, "processed": None, "train_data": None, "metrics": None}
+    SESSIONS[session_id] = {
+        "df": df,
+        "X": None,
+        "y": None,
+        "split": None,
+        "accuracy": None
+    }
 
     return jsonify({
         "session_id": session_id,
-        "rows": len(df),
-        "cols": len(df.columns),
+        "rows": df.shape[0],
         "columns": list(df.columns)
     })
 
 
-# ------------------------------------------------------
-# 2. PREPROCESS ROUTE
-# ------------------------------------------------------
+# =====================================================
+# 2. PREPROCESS
+# =====================================================
 @app.route("/preprocess", methods=["POST"])
 def preprocess():
     data = request.json
-    session_id = data.get("session_id")
-    method = data.get("method")
-    target = data.get("target")
+    session_id = data["session_id"]
+    method = data["method"]
+    target = data["target"]
 
     if session_id not in SESSIONS:
         return jsonify({"error": "Invalid session"}), 400
@@ -75,147 +65,139 @@ def preprocess():
     df = SESSIONS[session_id]["df"]
 
     if target not in df.columns:
-        return jsonify({"error": "Target column not found"}), 400
+        return jsonify({"error": "Invalid target column"}), 400
 
+    y_raw = df[target]
+    if y_raw.nunique() < 2:
+        return jsonify({"error": "Target must have at least 2 classes"}), 400
+
+    # Split X / y
     X = df.drop(columns=[target])
-    y = df[target]
+    y = y_raw.astype(str).astype("category").cat.codes
 
-    # Separate numeric and non-numeric columns
-    numeric = X.select_dtypes(include=["number"]).fillna(0)
-    non_numeric = X.select_dtypes(exclude=["number"]).fillna("")
+    # One-hot encode categorical features
+    X = pd.get_dummies(X, drop_first=True)
 
-    # Ensure numeric DataFrame always exists (even when empty)
-    if numeric is None or numeric.empty:
-        numeric = pd.DataFrame(index=X.index)
+    # Scale numeric columns only
+    numeric_cols = X.select_dtypes(include=["int64", "float64"]).columns
 
-    # Apply scaling ONLY if numeric exists
-    if numeric.shape[1] > 0:
-        if method == "standard":
-            scaler = StandardScaler()
-            numeric = pd.DataFrame(scaler.fit_transform(numeric), columns=numeric.columns)
+    if method == "standard":
+        X[numeric_cols] = StandardScaler().fit_transform(X[numeric_cols])
+    elif method == "minmax":
+        X[numeric_cols] = MinMaxScaler().fit_transform(X[numeric_cols])
 
-        elif method == "minmax":
-            scaler = MinMaxScaler()
-            numeric = pd.DataFrame(scaler.fit_transform(numeric), columns=numeric.columns)
-
-    # Encode non-numeric (categorical) features
-    if len(non_numeric.columns) > 0:
-        non_numeric = pd.get_dummies(non_numeric, drop_first=True)
-
-    # Combine everything
-    processed = pd.concat([numeric, non_numeric], axis=1)
-
-    # Final safety check
-    if processed.shape[1] == 0:
-        return jsonify({"error": "Dataset has no usable features"}), 400
-
-    SESSIONS[session_id]["processed"] = (processed, y)
+    SESSIONS[session_id]["X"] = X
+    SESSIONS[session_id]["y"] = y
 
     return jsonify({
-        "message": "Preprocessing done",
-        "features": list(processed.columns)
+        "message": "Preprocessing successful",
+        "feature_count": X.shape[1]
     })
 
 
-# ------------------------------------------------------
-# 3. TRAIN-TEST SPLIT ROUTE
-# ------------------------------------------------------
+# =====================================================
+# 3. TRAIN–TEST SPLIT  ✅ FIXED
+# =====================================================
 @app.route("/split", methods=["POST"])
 def split():
     data = request.json
-    session_id = data.get("session_id")
-    test_size = float(data.get("test_size", 0.2))
+    session_id = data["session_id"]
+    test_size = float(data["test_size"])
 
     if session_id not in SESSIONS:
         return jsonify({"error": "Invalid session"}), 400
 
-    processed = SESSIONS[session_id]["processed"]
-    if processed is None:
-        return jsonify({"error": "Preprocessing not done"}), 400
+    X = SESSIONS[session_id]["X"]
+    y = SESSIONS[session_id]["y"]
 
-    X, y = processed
-
-    if X.shape[1] == 0:
-        return jsonify({"error": "Dataset has no usable features"}), 400
+    if X is None or y is None:
+        return jsonify({"error": "Run preprocessing first"}), 400
 
     try:
+        # ✅ TRY STRATIFIED SPLIT (BEST PRACTICE)
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size, random_state=42
+            X,
+            y,
+            test_size=test_size,
+            random_state=42,
+            stratify=y
         )
-    except Exception as e:
-        return jsonify({"error": "Split failed", "details": str(e)}), 400
+        stratified = True
 
-    SESSIONS[session_id]["train_data"] = (X_train, X_test, y_train, y_test)
+    except ValueError:
+        # 🔥 FALLBACK FOR SMALL / UNIQUE CLASSES
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=test_size,
+            random_state=42
+        )
+        stratified = False
+
+    SESSIONS[session_id]["split"] = {
+        "X_train": X_train,
+        "X_test": X_test,
+        "y_train": y_train,
+        "y_test": y_test
+    }
 
     return jsonify({
-        "message": "Split completed",
-        "X_train_rows": len(X_train),
-        "X_test_rows": len(X_test)
+        "train_rows": len(X_train),
+        "test_rows": len(X_test),
+        "stratified": stratified
     })
 
 
-# ------------------------------------------------------
-# 4. TRAIN MODEL ROUTE
-# ------------------------------------------------------
+
+# =====================================================
+# 4. TRAIN MODEL
+# =====================================================
 @app.route("/train", methods=["POST"])
 def train():
     data = request.json
-    session_id = data.get("session_id")
-    model_type = data.get("model")
+    session_id = data["session_id"]
+    model_type = data["model"]
 
-    if session_id not in SESSIONS:
-        return jsonify({"error": "Invalid session"}), 400
+    split = SESSIONS.get(session_id, {}).get("split")
+    if not split:
+        return jsonify({"error": "Run train-test split first"}), 400
 
-    train_data = SESSIONS[session_id]["train_data"]
-    if train_data is None:
-        return jsonify({"error": "Split not done"}), 400
+    X_train = split["X_train"]
+    X_test = split["X_test"]
+    y_train = split["y_train"]
+    y_test = split["y_test"]
 
-    X_train, X_test, y_train, y_test = train_data
-
-    # Select model
     if model_type == "logistic":
-        model = LogisticRegression(max_iter=2000)
-    else:
+        model = LogisticRegression(max_iter=1000)
+    elif model_type == "decision_tree":
         model = DecisionTreeClassifier()
+    else:
+        return jsonify({"error": "Invalid model"}), 400
 
-    try:
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        acc = accuracy_score(y_test, preds)
-        report = classification_report(y_test, preds, output_dict=True)
-    except Exception as e:
-        return jsonify({"error": "Training failed", "details": str(e)}), 400
+    model.fit(X_train, y_train)
+    preds = model.predict(X_test)
 
-    model_path = os.path.join(MODEL_DIR, f"{session_id}_{model_type}.joblib")
-    joblib.dump(model, model_path)
+    acc = accuracy_score(y_test, preds)
+    SESSIONS[session_id]["accuracy"] = acc
 
-    SESSIONS[session_id]["metrics"] = {
-        "accuracy": acc,
-        "report": report
-    }
-
-    return jsonify({"message": "Training complete", "accuracy": acc})
+    return jsonify({
+        "accuracy": round(acc, 3)
+    })
 
 
-# ------------------------------------------------------
-# 5. RESULTS ROUTE
-# ------------------------------------------------------
+# =====================================================
+# 5. RESULTS
+# =====================================================
 @app.route("/results", methods=["GET"])
 def results():
     session_id = request.args.get("session_id")
+    acc = SESSIONS.get(session_id, {}).get("accuracy")
 
-    if session_id not in SESSIONS:
-        return jsonify({"error": "Invalid session"}), 400
-
-    metrics = SESSIONS[session_id]["metrics"]
-    if metrics is None:
-        return jsonify({"error": "No results available"}), 400
-
-    return jsonify(metrics)
+    return jsonify({
+        "status": "done" if acc is not None else "not_trained",
+        "accuracy": acc
+    })
 
 
-# ------------------------------------------------------
-# RUN SERVER
-# ------------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
